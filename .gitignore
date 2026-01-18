@@ -1,12 +1,16 @@
 # Secrets
 .env
 
-# Databases & data
-contacts.db
-contacts.csv
-optouts.txt
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
 
-# Cloudflare tunnel credentials
+# Logs
+*.log
+send_log.csv
+
+# Cloudflare
 .cloudflared/
 *.json
 
@@ -14,10 +18,5 @@ optouts.txt
 __pycache__/
 *.pyc
 
-# OS junk
-.DS_Store
-Thumbs.db
-
-# Virtual environments
+# Virtual env
 venv/
-.env/
