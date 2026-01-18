@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Databases & data
+contacts.db
+contacts.csv
+optouts.txt
+
+# Cloudflare tunnel credentials
+.cloudflared/
+*.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Virtual environments
+venv/
+.env/
