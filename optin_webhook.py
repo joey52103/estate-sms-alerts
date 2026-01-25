@@ -13,16 +13,10 @@ from twilio.twiml.messaging_response import MessagingResponse
 load_dotenv()
 
 app = Flask(__name__)
-
-# IMPORTANT: set this to a long random value in .env for sessions
-# Example: SECRET_KEY=1f5c... (use any long random string)
 app.secret_key = os.getenv("SECRET_KEY", "CHANGE_ME_PLEASE")
 
 DEFAULT_REGION = os.getenv("DEFAULT_REGION", "US")
-
-# Support both names so you don't get stuck again:
-# Your .env has DB_PATH=contacts.db
-DB_PATH = os.getenv("DB_PATH") or os.getenv("CONTACTS_DB", "contacts.db")
+DB_PATH = os.getenv("DB_PATH", "contacts.db")
 EXPORT_CSV = os.getenv("CONTACTS_CSV", "contacts.csv")
 OPTOUT_FILE = os.getenv("OPTOUT_FILE", "optouts.txt")
 
@@ -60,7 +54,7 @@ def clean_name(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"[^a-zA-Z\s'\-]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
-    return s[:30]
+    return s[:40]
 
 
 def db() -> sqlite3.Connection:
@@ -71,14 +65,16 @@ def db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    # Matches YOUR current schema:
+    # id INTEGER PK, phone TEXT NOT NULL, name TEXT, opted_out INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     with db() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS contacts (
-                phone TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL UNIQUE,
                 name TEXT DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'OPTED_IN',   -- OPTED_IN or OPTED_OUT
-                pending_name INTEGER NOT NULL DEFAULT 0,
+                opted_out INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -86,61 +82,82 @@ def init_db() -> None:
         )
 
 
-def get_contact(phone: str) -> Optional[dict]:
+def get_contact_by_phone(phone: str) -> Optional[dict]:
     init_db()
     with db() as conn:
         row = conn.execute(
-            "SELECT phone, name, status, pending_name, created_at, updated_at FROM contacts WHERE phone = ?",
+            "SELECT id, phone, name, opted_out, created_at, updated_at FROM contacts WHERE phone = ?",
             (phone,),
         ).fetchone()
-        if not row:
-            return None
-        return dict(row)
+        return dict(row) if row else None
 
 
-def upsert_contact(
-    phone: str,
-    *,
-    name: Optional[str] = None,
-    status: Optional[str] = None,
-    pending_name: Optional[int] = None,
-) -> None:
+def add_contact(phone: str, name: str = "") -> bool:
+    """Returns True if added, False if already exists."""
     init_db()
     now = utc_now()
+    try:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO contacts (phone, name, opted_out, created_at, updated_at)
+                VALUES (?, ?, 0, ?, ?)
+                """,
+                (phone, name, now, now),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def set_opted_out(phone: str, opted_out: int) -> None:
+    init_db()
     with db() as conn:
-        row = conn.execute(
-            "SELECT phone, name, status, pending_name, created_at FROM contacts WHERE phone = ?",
-            (phone,),
-        ).fetchone()
-
-        if row is None:
-            conn.execute(
-                """
-                INSERT INTO contacts (phone, name, status, pending_name, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (phone, name or "", status or "OPTED_IN", int(pending_name or 0), now, now),
-            )
-        else:
-            old_created = row["created_at"]
-            new_name = name if name is not None else row["name"]
-            new_status = status if status is not None else row["status"]
-            new_pending = int(pending_name) if pending_name is not None else int(row["pending_name"])
-
-            conn.execute(
-                """
-                UPDATE contacts
-                SET name = ?, status = ?, pending_name = ?, created_at = ?, updated_at = ?
-                WHERE phone = ?
-                """,
-                (new_name, new_status, new_pending, old_created, now, phone),
-            )
+        conn.execute(
+            "UPDATE contacts SET opted_out = ?, updated_at = ? WHERE phone = ?",
+            (1 if opted_out else 0, utc_now(), phone),
+        )
 
 
 def delete_contact(phone: str) -> None:
     init_db()
     with db() as conn:
         conn.execute("DELETE FROM contacts WHERE phone = ?", (phone,))
+
+
+def update_contact(old_phone: str, new_phone: str, new_name: str) -> Optional[str]:
+    """
+    Updates phone and name. Returns error string or None on success.
+    """
+    init_db()
+    old = get_contact_by_phone(old_phone)
+    if not old:
+        return "Contact not found."
+
+    # If phone changed to another existing phone -> error
+    if new_phone != old_phone and get_contact_by_phone(new_phone):
+        return "That phone number already exists."
+
+    with db() as conn:
+        if new_phone != old_phone:
+            conn.execute(
+                """
+                UPDATE contacts
+                SET phone = ?, name = ?, updated_at = ?
+                WHERE phone = ?
+                """,
+                (new_phone, new_name, utc_now(), old_phone),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE contacts
+                SET name = ?, updated_at = ?
+                WHERE phone = ?
+                """,
+                (new_name, utc_now(), old_phone),
+            )
+    return None
 
 
 def list_contacts(q: str = "") -> List[Dict]:
@@ -151,7 +168,7 @@ def list_contacts(q: str = "") -> List[Dict]:
             like = f"%{q}%"
             rows = conn.execute(
                 """
-                SELECT phone, name, status, pending_name, created_at, updated_at
+                SELECT id, phone, name, opted_out, created_at, updated_at
                 FROM contacts
                 WHERE phone LIKE ? OR name LIKE ?
                 ORDER BY updated_at DESC
@@ -161,7 +178,7 @@ def list_contacts(q: str = "") -> List[Dict]:
         else:
             rows = conn.execute(
                 """
-                SELECT phone, name, status, pending_name, created_at, updated_at
+                SELECT id, phone, name, opted_out, created_at, updated_at
                 FROM contacts
                 ORDER BY updated_at DESC
                 """
@@ -173,10 +190,10 @@ def export_contacts_csv_and_optouts() -> None:
     init_db()
     with db() as conn:
         opted_in = conn.execute(
-            "SELECT phone, name FROM contacts WHERE status = 'OPTED_IN' ORDER BY updated_at DESC"
+            "SELECT phone, name FROM contacts WHERE opted_out = 0 ORDER BY updated_at DESC"
         ).fetchall()
         opted_out = conn.execute(
-            "SELECT phone FROM contacts WHERE status = 'OPTED_OUT' ORDER BY updated_at DESC"
+            "SELECT phone FROM contacts WHERE opted_out = 1 ORDER BY updated_at DESC"
         ).fetchall()
 
     with open(EXPORT_CSV, "w", newline="", encoding="utf-8") as f:
@@ -206,7 +223,7 @@ def require_admin():
 
 
 # -------------------------
-# Admin UI (with top nav)
+# Admin UI
 # -------------------------
 BASE_HTML = """
 <!doctype html>
@@ -217,7 +234,7 @@ BASE_HTML = """
   <style>
     body{font-family:system-ui;margin:40px;max-width:980px}
     .card{border:1px solid #ddd;border-radius:14px;padding:18px}
-    input{padding:10px;margin:6px 0;border:1px solid #ccc;border-radius:10px;width:100%}
+    input,select{padding:10px;margin:6px 0;border:1px solid #ccc;border-radius:10px;width:100%}
     button{padding:10px 14px;border:0;border-radius:10px;background:#0b5fff;color:white;cursor:pointer}
     .btn2{background:#555}
     .btnDanger{background:#b00020}
@@ -266,17 +283,6 @@ def home():
     return redirect(url_for("admin_login"))
 
 
-@app.route("/_routes")
-def show_routes():
-    # handy for debugging (you already used this)
-    routes = []
-    for rule in app.url_map.iter_rules():
-        if rule.endpoint != "static":
-            routes.append(str(rule))
-    routes.sort()
-    return "\n".join(routes), 200, {"Content-Type": "text/plain; charset=utf-8"}
-
-
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     if admin_logged_in():
@@ -287,6 +293,7 @@ def admin_login():
         user = (request.form.get("user") or "").strip()
         pw = (request.form.get("password") or "").strip()
 
+        # IMPORTANT: ADMIN_PASSWORD must be set (non-empty) in .env
         if user == ADMIN_USER and ADMIN_PASSWORD and pw == ADMIN_PASSWORD:
             session["admin_authed"] = True
             return redirect(url_for("admin_add"))
@@ -333,11 +340,10 @@ def admin_add():
         if not phone:
             error = "That phone number looks invalid. Try again (include area code)."
         else:
-            existing = get_contact(phone)
-            if existing:
+            added = add_contact(phone, name)
+            if not added:
                 error = "Number already added."
             else:
-                upsert_contact(phone, name=name, status="OPTED_IN", pending_name=0)
                 export_contacts_csv_and_optouts()
                 ok = f"Added: {phone}" + (f" ({name})" if name else "")
 
@@ -372,12 +378,12 @@ def admin_contacts():
 
     rows_html = ""
     for c in contacts:
-        status = c["status"]
-        pill = "<span class='pill in'>OPTED IN</span>" if status == "OPTED_IN" else "<span class='pill out'>OPTED OUT</span>"
         phone = c["phone"]
         name = (c["name"] or "").strip()
-        created = c["created_at"]
+        opted_out = int(c["opted_out"]) == 1
         updated = c["updated_at"]
+
+        pill = "<span class='pill out'>OPTED OUT</span>" if opted_out else "<span class='pill in'>OPTED IN</span>"
 
         rows_html += f"""
         <tr>
@@ -437,7 +443,7 @@ def admin_contacts_optout():
     phone = request.form.get("phone") or ""
     phone = normalize_e164(phone, DEFAULT_REGION) or phone
     if phone:
-        upsert_contact(phone, status="OPTED_OUT", pending_name=0)
+        set_opted_out(phone, 1)
         export_contacts_csv_and_optouts()
     return redirect(url_for("admin_contacts"))
 
@@ -451,7 +457,7 @@ def admin_contacts_optin():
     phone = request.form.get("phone") or ""
     phone = normalize_e164(phone, DEFAULT_REGION) or phone
     if phone:
-        upsert_contact(phone, status="OPTED_IN", pending_name=0)
+        set_opted_out(phone, 0)
         export_contacts_csv_and_optouts()
     return redirect(url_for("admin_contacts"))
 
@@ -479,7 +485,7 @@ def admin_contacts_edit():
     if request.method == "GET":
         phone = request.args.get("phone", "") or ""
         phone_norm = normalize_e164(phone, DEFAULT_REGION) or phone
-        c = get_contact(phone_norm)
+        c = get_contact_by_phone(phone_norm)
         if not c:
             return redirect(url_for("admin_contacts"))
 
@@ -496,9 +502,9 @@ def admin_contacts_edit():
             <input name="name" value="{(c['name'] or '').replace('"','&quot;')}" />
 
             <label>Status</label>
-            <select name="status" style="padding:10px;border-radius:10px;border:1px solid #ccc;width:100%">
-              <option value="OPTED_IN" {"selected" if c["status"]=="OPTED_IN" else ""}>OPTED_IN</option>
-              <option value="OPTED_OUT" {"selected" if c["status"]=="OPTED_OUT" else ""}>OPTED_OUT</option>
+            <select name="opted_out">
+              <option value="0" {"selected" if int(c["opted_out"])==0 else ""}>OPTED IN</option>
+              <option value="1" {"selected" if int(c["opted_out"])==1 else ""}>OPTED OUT</option>
             </select>
 
             <div style="margin-top:14px">
@@ -514,61 +520,23 @@ def admin_contacts_edit():
     old_phone = request.form.get("old_phone") or ""
     new_phone_raw = request.form.get("new_phone") or ""
     new_name_raw = request.form.get("name") or ""
-    new_status = (request.form.get("status") or "OPTED_IN").strip().upper()
+    opted_out_raw = request.form.get("opted_out") or "0"
 
     old_phone = normalize_e164(old_phone, DEFAULT_REGION) or old_phone
     new_phone = normalize_e164(new_phone_raw, DEFAULT_REGION)
-
     if not new_phone:
-        # re-render quick error page
-        body = """
-        <h2>Edit Contact</h2>
-        <p class="err">Invalid phone number.</p>
-        <p><a href="/admin/contacts">Back</a></p>
-        """
-        return render_admin("Edit Contact", body)
-
-    if new_status not in {"OPTED_IN", "OPTED_OUT"}:
-        new_status = "OPTED_IN"
+        return render_admin("Edit Contact", "<p class='err'>Invalid phone number.</p><p><a href='/admin/contacts'>Back</a></p>")
 
     new_name = clean_name(new_name_raw)
+    err = update_contact(old_phone, new_phone, new_name)
+    if err:
+        return render_admin("Edit Contact", f"<p class='err'>{err}</p><p><a href='/admin/contacts'>Back</a></p>")
 
-    # If changing phone to one that already exists (and it's not the same record)
-    if new_phone != old_phone and get_contact(new_phone):
-        body = f"""
-        <h2>Edit Contact</h2>
-        <p class="err">That phone number already exists.</p>
-        <p><a href="/admin/contacts/edit?phone={old_phone}">Back to edit</a></p>
-        """
-        return render_admin("Edit Contact", body)
-
-    # update record
-    existing = get_contact(old_phone)
-    if not existing:
-        return redirect(url_for("admin_contacts"))
-
-    created_at = existing["created_at"]
-
-    with db() as conn:
-        # delete old if phone changed
-        if new_phone != old_phone:
-            conn.execute("DELETE FROM contacts WHERE phone = ?", (old_phone,))
-            conn.execute(
-                """
-                INSERT INTO contacts (phone, name, status, pending_name, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (new_phone, new_name, new_status, 0, created_at, utc_now()),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE contacts
-                SET name = ?, status = ?, pending_name = 0, updated_at = ?
-                WHERE phone = ?
-                """,
-                (new_name, new_status, utc_now(), old_phone),
-            )
+    try:
+        opted_out_val = 1 if str(opted_out_raw).strip() == "1" else 0
+        set_opted_out(new_phone, opted_out_val)
+    except Exception:
+        pass
 
     export_contacts_csv_and_optouts()
     return redirect(url_for("admin_contacts"))
@@ -583,7 +551,7 @@ def inbound_sms():
 
     from_number = request.form.get("From", "")
     body = (request.form.get("Body") or "").strip()
-    body_upper_tokens = tokens_upper(body)
+    toks = tokens_upper(body)
 
     phone = normalize_e164(from_number, DEFAULT_REGION)
 
@@ -592,43 +560,54 @@ def inbound_sms():
         resp.message("Invalid number. Reply JOIN to subscribe. Reply STOP to opt out.")
         return str(resp), 200, {"Content-Type": "application/xml"}
 
-    contact = get_contact(phone)
+    c = get_contact_by_phone(phone)
 
-    if body_upper_tokens & OPTOUT_KEYWORDS:
-        upsert_contact(phone, status="OPTED_OUT", pending_name=0)
+    if toks & OPTOUT_KEYWORDS:
+        if c:
+            set_opted_out(phone, 1)
+        else:
+            # create contact as opted out so it appears in optouts
+            add_contact(phone, "")
+            set_opted_out(phone, 1)
         export_contacts_csv_and_optouts()
         resp.message("You’re opted out. Reply START to resubscribe.")
         return str(resp), 200, {"Content-Type": "application/xml"}
 
-    if body_upper_tokens & HELP_KEYWORDS:
+    if toks & HELP_KEYWORDS:
         resp.message("Reply JOIN to subscribe. Reply STOP to opt out.")
         return str(resp), 200, {"Content-Type": "application/xml"}
 
-    if body_upper_tokens & OPTIN_KEYWORDS:
-        need_name = 1 if ASK_NAME_ON_JOIN else 0
-        existing_name = (contact["name"] if contact else "").strip() if contact else ""
-        if existing_name:
-            need_name = 0
-
-        upsert_contact(phone, status="OPTED_IN", pending_name=need_name)
-        export_contacts_csv_and_optouts()
-
-        if need_name:
-            resp.message("You’re subscribed! Reply with your first name (example: Joey). Reply STOP to opt out.")
-        else:
+    if toks & OPTIN_KEYWORDS:
+        if c:
+            set_opted_out(phone, 0)
+            export_contacts_csv_and_optouts()
             resp.message("You’re subscribed! Reply STOP to opt out.")
-        return str(resp), 200, {"Content-Type": "application/xml"}
-
-    if contact and contact["status"] == "OPTED_IN" and int(contact["pending_name"]) == 1:
-        name = clean_name(body)
-        if not name:
-            resp.message("Please reply with just your first name (example: Joey). Reply STOP to opt out.")
             return str(resp), 200, {"Content-Type": "application/xml"}
 
-        upsert_contact(phone, name=name, pending_name=0)
-        export_contacts_csv_and_optouts()
-        resp.message(f"Thanks, {name}! You’re all set. Reply STOP to opt out.")
-        return str(resp), 200, {"Content-Type": "application/xml"}
+        # new subscriber
+        if ASK_NAME_ON_JOIN:
+            # create pending w/ blank name; next message becomes name (simple approach)
+            add_contact(phone, "")
+            set_opted_out(phone, 0)
+            export_contacts_csv_and_optouts()
+            resp.message("You’re subscribed! Reply with your first name (example: Joey). Reply STOP to opt out.")
+            # We'll interpret the next non-keyword message as name if name is blank.
+            return str(resp), 200, {"Content-Type": "application/xml"}
+        else:
+            add_contact(phone, "")
+            set_opted_out(phone, 0)
+            export_contacts_csv_and_optouts()
+            resp.message("You’re subscribed! Reply STOP to opt out.")
+            return str(resp), 200, {"Content-Type": "application/xml"}
+
+    # If opted in and name is empty, treat message as name (only if not a keyword)
+    if c and int(c["opted_out"]) == 0 and ASK_NAME_ON_JOIN and not (c["name"] or "").strip():
+        name = clean_name(body)
+        if name:
+            update_contact(phone, phone, name)
+            export_contacts_csv_and_optouts()
+            resp.message(f"Thanks, {name}! You’re all set. Reply STOP to opt out.")
+            return str(resp), 200, {"Content-Type": "application/xml"}
 
     resp.message("Reply JOIN to subscribe. Reply STOP to opt out.")
     return str(resp), 200, {"Content-Type": "application/xml"}
