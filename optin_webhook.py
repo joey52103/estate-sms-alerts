@@ -3,7 +3,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict
 
 from dotenv import load_dotenv
 from flask import Flask, request, redirect, url_for, session, render_template_string
@@ -15,11 +15,14 @@ load_dotenv()
 app = Flask(__name__)
 
 # IMPORTANT: set this to a long random value in .env for sessions
+# Example: SECRET_KEY=1f5c... (use any long random string)
 app.secret_key = os.getenv("SECRET_KEY", "CHANGE_ME_PLEASE")
 
 DEFAULT_REGION = os.getenv("DEFAULT_REGION", "US")
 
-DB_PATH = os.getenv("CONTACTS_DB", "contacts.db")
+# Support both names so you don't get stuck again:
+# Your .env has DB_PATH=contacts.db
+DB_PATH = os.getenv("DB_PATH") or os.getenv("CONTACTS_DB", "contacts.db")
 EXPORT_CSV = os.getenv("CONTACTS_CSV", "contacts.csv")
 OPTOUT_FILE = os.getenv("OPTOUT_FILE", "optouts.txt")
 
@@ -36,6 +39,10 @@ ASK_NAME_ON_JOIN = True
 # -------------------------
 # Helpers
 # -------------------------
+def utc_now() -> str:
+    return datetime.utcnow().isoformat()
+
+
 def normalize_e164(raw: str, default_region: str = "US") -> Optional[str]:
     raw = (raw or "").strip()
     if not raw:
@@ -58,6 +65,7 @@ def clean_name(s: str) -> str:
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
@@ -78,6 +86,18 @@ def init_db() -> None:
         )
 
 
+def get_contact(phone: str) -> Optional[dict]:
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT phone, name, status, pending_name, created_at, updated_at FROM contacts WHERE phone = ?",
+            (phone,),
+        ).fetchone()
+        if not row:
+            return None
+        return dict(row)
+
+
 def upsert_contact(
     phone: str,
     *,
@@ -85,13 +105,13 @@ def upsert_contact(
     status: Optional[str] = None,
     pending_name: Optional[int] = None,
 ) -> None:
-    now = datetime.utcnow().isoformat()
+    init_db()
+    now = utc_now()
     with db() as conn:
-        cur = conn.execute(
+        row = conn.execute(
             "SELECT phone, name, status, pending_name, created_at FROM contacts WHERE phone = ?",
             (phone,),
-        )
-        row = cur.fetchone()
+        ).fetchone()
 
         if row is None:
             conn.execute(
@@ -102,10 +122,10 @@ def upsert_contact(
                 (phone, name or "", status or "OPTED_IN", int(pending_name or 0), now, now),
             )
         else:
-            old_created = row[4]
-            new_name = name if name is not None else row[1]
-            new_status = status if status is not None else row[2]
-            new_pending = int(pending_name) if pending_name is not None else row[3]
+            old_created = row["created_at"]
+            new_name = name if name is not None else row["name"]
+            new_status = status if status is not None else row["status"]
+            new_pending = int(pending_name) if pending_name is not None else int(row["pending_name"])
 
             conn.execute(
                 """
@@ -117,16 +137,36 @@ def upsert_contact(
             )
 
 
-def get_contact(phone: str) -> Optional[dict]:
+def delete_contact(phone: str) -> None:
+    init_db()
     with db() as conn:
-        cur = conn.execute(
-            "SELECT phone, name, status, pending_name FROM contacts WHERE phone = ?",
-            (phone,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {"phone": row[0], "name": row[1], "status": row[2], "pending_name": row[3]}
+        conn.execute("DELETE FROM contacts WHERE phone = ?", (phone,))
+
+
+def list_contacts(q: str = "") -> List[Dict]:
+    init_db()
+    q = (q or "").strip()
+    with db() as conn:
+        if q:
+            like = f"%{q}%"
+            rows = conn.execute(
+                """
+                SELECT phone, name, status, pending_name, created_at, updated_at
+                FROM contacts
+                WHERE phone LIKE ? OR name LIKE ?
+                ORDER BY updated_at DESC
+                """,
+                (like, like),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT phone, name, status, pending_name, created_at, updated_at
+                FROM contacts
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def export_contacts_csv_and_optouts() -> None:
@@ -142,12 +182,12 @@ def export_contacts_csv_and_optouts() -> None:
     with open(EXPORT_CSV, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["phone", "name"])
-        for phone, name in opted_in:
-            w.writerow([phone, name or ""])
+        for row in opted_in:
+            w.writerow([row["phone"], row["name"] or ""])
 
     with open(OPTOUT_FILE, "w", encoding="utf-8") as f:
-        for (phone,) in opted_out:
-            f.write(phone + "\n")
+        for row in opted_out:
+            f.write(row["phone"] + "\n")
 
 
 def tokens_upper(body: str) -> set:
@@ -159,246 +199,90 @@ def admin_logged_in() -> bool:
     return session.get("admin_authed") is True
 
 
+def require_admin():
+    if not admin_logged_in():
+        return redirect(url_for("admin_login"))
+    return None
+
+
 # -------------------------
-# Admin UI
+# Admin UI (with top nav)
 # -------------------------
-ADMIN_NAV = """
-<div class="nav">
-  <div class="brand">J Maslanka Estates – Admin</div>
-  <div class="links">
-    <a href="/admin/add">Add Contact</a>
-    <a href="/admin/contacts">Contacts</a>
-    <a href="/admin/logout">Logout</a>
+BASE_HTML = """
+<!doctype html>
+<html>
+<head>
+  <title>{{ title }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:system-ui;margin:40px;max-width:980px}
+    .card{border:1px solid #ddd;border-radius:14px;padding:18px}
+    input{padding:10px;margin:6px 0;border:1px solid #ccc;border-radius:10px;width:100%}
+    button{padding:10px 14px;border:0;border-radius:10px;background:#0b5fff;color:white;cursor:pointer}
+    .btn2{background:#555}
+    .btnDanger{background:#b00020}
+    .ok{color:#0a7a2f;font-weight:700}
+    .err{color:#b00020;font-weight:700}
+    a{color:#0b5fff;text-decoration:none}
+    .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid #eee}
+    .navleft a{margin-right:14px;font-weight:600}
+    table{border-collapse:collapse;width:100%}
+    th,td{border:1px solid #ddd;padding:10px;text-align:left;vertical-align:top}
+    th{background:#f7f7f7}
+    .rowActions form{display:inline}
+    .pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px}
+    .in{background:#e9f7ef;color:#0a7a2f}
+    .out{background:#fdecea;color:#b00020}
+    .muted{color:#666}
+    .searchRow{display:flex;gap:10px;align-items:center;margin:10px 0 18px}
+    .searchRow input{flex:1}
+  </style>
+</head>
+<body>
+  {% if show_nav %}
+  <div class="nav">
+    <div class="navleft">
+      <a href="/admin/add">Add Contact</a>
+      <a href="/admin/contacts">Contacts</a>
+    </div>
+    <div class="navright">
+      <a href="/admin/logout">Logout</a>
+    </div>
   </div>
-</div>
-"""
+  {% endif %}
 
-BASE_STYLE = """
-<style>
-body{font-family:system-ui;margin:40px;max-width:1000px}
-.card{border:1px solid #ddd;border-radius:14px;padding:18px}
-input,select{padding:10px;margin:8px 0;border:1px solid #ccc;border-radius:10px}
-button{padding:10px 14px;border:0;border-radius:10px;background:#0b5fff;color:white;cursor:pointer}
-small{color:#555}
-.ok{color:#0a7a2f;font-weight:600}
-.err{color:#b00020;font-weight:600}
-a{color:#0b5fff;text-decoration:none}
-.nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px;padding-bottom:12px;border-bottom:1px solid #eee}
-.nav .brand{font-weight:700}
-.nav .links a{margin-left:14px}
-table{border-collapse:collapse;width:100%;margin-top:12px}
-th,td{border:1px solid #ddd;padding:8px;vertical-align:top}
-th{background:#f3f3f3;text-align:left}
-.badge{padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700;display:inline-block}
-.in{background:#e7f7ee;color:#0a7a2f}
-.out{background:#fdecec;color:#b00020}
-.actions form{display:inline-block;margin-right:6px}
-</style>
-"""
-
-LOGIN_HTML = f"""
-<!doctype html>
-<title>Admin Login</title>
-{BASE_STYLE}
-<h2>Admin Login</h2>
-<div class="card">
-  <form method="post">
-    <label>Username</label><br>
-    <input name="user" autocomplete="username" required style="width:100%">
-    <label>Password</label><br>
-    <input name="password" type="password" autocomplete="current-password" required style="width:100%">
-    <button type="submit" style="width:100%">Sign in</button>
-    {{% if error %}}<div class="err" style="margin-top:10px">{{{{error}}}}</div>{{% endif %}}
-  </form>
-</div>
-"""
-
-ADD_HTML = f"""
-<!doctype html>
-<title>Add Contact</title>
-{BASE_STYLE}
-{ADMIN_NAV}
-
-<div class="card">
-  <h2 style="margin-top:0">Add Contact</h2>
-  <form method="post">
-    <label>Phone number</label><br>
-    <input name="phone" placeholder="(412) 555-1234" required style="width:100%">
-    <label>Name (optional)</label><br>
-    <input name="name" placeholder="Joey" style="width:100%">
-    <button type="submit">Add</button>
-  </form>
-
-  {{% if ok %}}<p class="ok">{{{{ok}}}}</p>{{% endif %}}
-  {{% if error %}}<p class="err">{{{{error}}}}</p>{{% endif %}}
-
-  <p><small>Saved to database and exported to contacts.csv automatically.</small></p>
-</div>
-"""
-
-CONTACTS_HTML = f"""
-<!doctype html>
-<title>Contacts</title>
-{BASE_STYLE}
-{ADMIN_NAV}
-
-<div class="card">
-  <h2 style="margin-top:0">Contacts</h2>
-
-  <form method="get">
-    <input name="q" placeholder="search phone or name" value="{{{{q}}}}" style="width:320px">
-    <select name="status">
-      <option value="ALL" {{{{ "selected" if status=="ALL" else "" }}}}>All</option>
-      <option value="OPTED_IN" {{{{ "selected" if status=="OPTED_IN" else "" }}}}>Opted In</option>
-      <option value="OPTED_OUT" {{{{ "selected" if status=="OPTED_OUT" else "" }}}}>Opted Out</option>
-    </select>
-    <button type="submit">Search</button>
-  </form>
-
-  {{% if ok %}}<p class="ok">{{{{ok}}}}</p>{{% endif %}}
-  {{% if error %}}<p class="err">{{{{error}}}}</p>{{% endif %}}
-
-  <table>
-    <thead>
-      <tr>
-        <th>Phone</th>
-        <th>Name</th>
-        <th>Status</th>
-        <th>Actions</th>
-        <th>Edit</th>
-      </tr>
-    </thead>
-    <tbody>
-      {{% for r in rows %}}
-      <tr>
-        <td>{{{{r["phone"]}}}}</td>
-        <td>{{{{r["name"] or ""}}}}</td>
-        <td>
-          {{% if r["status"] == "OPTED_IN" %}}
-            <span class="badge in">OPTED IN</span>
-          {{% else %}}
-            <span class="badge out">OPTED OUT</span>
-          {{% endif %}}
-        </td>
-
-        <td class="actions">
-          {{% if r["status"] == "OPTED_IN" %}}
-          <form method="post" action="/admin/contacts/optout">
-            <input type="hidden" name="phone" value="{{{{r["phone"]}}}}">
-            <button type="submit">Opt out</button>
-          </form>
-          {{% else %}}
-          <form method="post" action="/admin/contacts/optin">
-            <input type="hidden" name="phone" value="{{{{r["phone"]}}}}">
-            <button type="submit">Opt in</button>
-          </form>
-          {{% endif %}}
-
-          <form method="post" action="/admin/contacts/delete" onsubmit="return confirm('Delete this number?');">
-            <input type="hidden" name="phone" value="{{{{r["phone"]}}}}">
-            <button type="submit">Delete</button>
-          </form>
-        </td>
-
-        <td>
-          <form method="post" action="/admin/contacts/edit">
-            <input type="hidden" name="old_phone" value="{{{{r["phone"]}}}}">
-            <div><small>Phone</small></div>
-            <input name="new_phone" value="{{{{r["phone"]}}}}" style="width:220px">
-            <div><small>Name</small></div>
-            <input name="name" value="{{{{r["name"] or ""}}}}" style="width:220px">
-            <button type="submit" style="margin-top:6px">Save</button>
-          </form>
-        </td>
-      </tr>
-      {{% endfor %}}
-    </tbody>
-  </table>
-</div>
+  {{ body|safe }}
+</body>
+</html>
 """
 
 
-def contact_exists(phone: str) -> bool:
-    with db() as conn:
-        row = conn.execute("SELECT 1 FROM contacts WHERE phone = ?", (phone,)).fetchone()
-        return row is not None
+def render_admin(title: str, body: str, *, show_nav: bool = True) -> str:
+    return render_template_string(BASE_HTML, title=title, body=body, show_nav=show_nav)
 
 
-def list_contacts(q: str = "", status: str = "ALL"):
-    q = (q or "").strip()
-    status = (status or "ALL").upper()
-
-    where = []
-    params = []
-
-    if q:
-        like = f"%{q}%"
-        where.append("(phone LIKE ? OR name LIKE ?)")
-        params.extend([like, like])
-
-    if status in ("OPTED_IN", "OPTED_OUT"):
-        where.append("status = ?")
-        params.append(status)
-
-    where_sql = "WHERE " + " AND ".join(where) if where else ""
-    sql = f"""
-        SELECT phone, name, status
-        FROM contacts
-        {where_sql}
-        ORDER BY updated_at DESC
-        LIMIT 500
-    """
-
-    with db() as conn:
-        return conn.execute(sql, params).fetchall()
+@app.route("/")
+def home():
+    return redirect(url_for("admin_login"))
 
 
-def set_status(phone: str, status: str) -> None:
-    now = datetime.utcnow().isoformat()
-    with db() as conn:
-        conn.execute(
-            "UPDATE contacts SET status = ?, pending_name = 0, updated_at = ? WHERE phone = ?",
-            (status, now, phone),
-        )
+@app.route("/_routes")
+def show_routes():
+    # handy for debugging (you already used this)
+    routes = []
+    for rule in app.url_map.iter_rules():
+        if rule.endpoint != "static":
+            routes.append(str(rule))
+    routes.sort()
+    return "\n".join(routes), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
-def delete_contact(phone: str) -> None:
-    with db() as conn:
-        conn.execute("DELETE FROM contacts WHERE phone = ?", (phone,))
-
-
-def edit_contact(old_phone: str, new_phone: str, name: str) -> tuple[bool, str]:
-    # block changing to a phone that already exists
-    if new_phone != old_phone and contact_exists(new_phone):
-        return False, "Number already added."
-
-    now = datetime.utcnow().isoformat()
-    with db() as conn:
-        row = conn.execute("SELECT phone FROM contacts WHERE phone = ?", (old_phone,)).fetchone()
-        if not row:
-            return False, "Number not found."
-
-        conn.execute(
-            """
-            UPDATE contacts
-            SET phone = ?, name = ?, updated_at = ?
-            WHERE phone = ?
-            """,
-            (new_phone, name, now, old_phone),
-        )
-
-    return True, "Updated."
-
-
-# -------------------------
-# Admin routes
-# -------------------------
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     if admin_logged_in():
         return redirect(url_for("admin_add"))
 
-    error = None
+    error = ""
     if request.method == "POST":
         user = (request.form.get("user") or "").strip()
         pw = (request.form.get("password") or "").strip()
@@ -408,7 +292,20 @@ def admin_login():
             return redirect(url_for("admin_add"))
         error = "Invalid login."
 
-    return render_template_string(LOGIN_HTML, error=error)
+    body = f"""
+    <h2>J Maslanka Estates – Admin</h2>
+    <div class="card" style="max-width:520px">
+      <form method="post">
+        <label>Username</label>
+        <input name="user" autocomplete="username" required />
+        <label>Password</label>
+        <input name="password" type="password" autocomplete="current-password" required />
+        <button type="submit" style="width:100%">Sign in</button>
+        {"<div class='err' style='margin-top:10px'>" + error + "</div>" if error else ""}
+      </form>
+    </div>
+    """
+    return render_admin("Admin Login", body, show_nav=False)
 
 
 @app.route("/admin/logout")
@@ -419,14 +316,14 @@ def admin_logout():
 
 @app.route("/admin/add", methods=["GET", "POST"])
 def admin_add():
-    if not admin_logged_in():
-        return redirect(url_for("admin_login"))
+    gate = require_admin()
+    if gate:
+        return gate
 
-    ok = None
-    error = None
+    ok = ""
+    error = ""
 
     if request.method == "POST":
-        init_db()
         raw_phone = request.form.get("phone") or ""
         raw_name = request.form.get("name") or ""
 
@@ -436,92 +333,245 @@ def admin_add():
         if not phone:
             error = "That phone number looks invalid. Try again (include area code)."
         else:
-            if contact_exists(phone):
+            existing = get_contact(phone)
+            if existing:
                 error = "Number already added."
             else:
                 upsert_contact(phone, name=name, status="OPTED_IN", pending_name=0)
                 export_contacts_csv_and_optouts()
                 ok = f"Added: {phone}" + (f" ({name})" if name else "")
 
-    return render_template_string(ADD_HTML, ok=ok, error=error)
+    body = f"""
+    <h2>Admin – Add Contact</h2>
+    <div class="card" style="max-width:720px">
+      <form method="post">
+        <label>Phone number</label>
+        <input name="phone" placeholder="(412) 555-1234" required />
+        <label>Name (optional)</label>
+        <input name="name" placeholder="Joey" />
+        <button type="submit">Add</button>
+      </form>
+
+      {"<p class='ok'>" + ok + "</p>" if ok else ""}
+      {"<p class='err'>" + error + "</p>" if error else ""}
+
+      <p class="muted"><small>Saved to database and exported to contacts.csv automatically.</small></p>
+    </div>
+    """
+    return render_admin("Add Contact", body)
 
 
 @app.route("/admin/contacts", methods=["GET"])
 def admin_contacts():
-    if not admin_logged_in():
-        return redirect(url_for("admin_login"))
+    gate = require_admin()
+    if gate:
+        return gate
 
-    init_db()
-    q = (request.args.get("q") or "").strip()
-    status = (request.args.get("status") or "ALL").strip().upper()
+    q = request.args.get("q", "") or ""
+    contacts = list_contacts(q=q)
 
-    rows = list_contacts(q=q, status=status)
-    return render_template_string(CONTACTS_HTML, rows=rows, q=q, status=status, ok=None, error=None)
+    rows_html = ""
+    for c in contacts:
+        status = c["status"]
+        pill = "<span class='pill in'>OPTED IN</span>" if status == "OPTED_IN" else "<span class='pill out'>OPTED OUT</span>"
+        phone = c["phone"]
+        name = (c["name"] or "").strip()
+        created = c["created_at"]
+        updated = c["updated_at"]
+
+        rows_html += f"""
+        <tr>
+          <td><strong>{phone}</strong><br><span class="muted">{name}</span></td>
+          <td>{pill}<br><span class="muted">Updated: {updated}</span></td>
+          <td class="rowActions">
+            <form method="post" action="/admin/contacts/optin">
+              <input type="hidden" name="phone" value="{phone}">
+              <button type="submit">Opt In</button>
+            </form>
+            <form method="post" action="/admin/contacts/optout">
+              <input type="hidden" name="phone" value="{phone}">
+              <button type="submit" class="btn2">Opt Out</button>
+            </form>
+            <form method="get" action="/admin/contacts/edit">
+              <input type="hidden" name="phone" value="{phone}">
+              <button type="submit" class="btn2">Edit</button>
+            </form>
+            <form method="post" action="/admin/contacts/delete" onsubmit="return confirm('Delete this number?');">
+              <input type="hidden" name="phone" value="{phone}">
+              <button type="submit" class="btnDanger">Delete</button>
+            </form>
+          </td>
+        </tr>
+        """
+
+    body = f"""
+    <h2>Admin – Contacts</h2>
+
+    <form method="get" class="searchRow">
+      <input name="q" placeholder="Search phone or name" value="{q.replace('"', '&quot;')}" />
+      <button type="submit">Search</button>
+      <a href="/admin/contacts" class="muted" style="align-self:center">Clear</a>
+    </form>
+
+    <div class="card">
+      <p class="muted">Showing <strong>{len(contacts)}</strong> contact(s)</p>
+      <table>
+        <tr>
+          <th>Contact</th>
+          <th>Status</th>
+          <th>Actions</th>
+        </tr>
+        {rows_html if rows_html else "<tr><td colspan='3'>No contacts found.</td></tr>"}
+      </table>
+    </div>
+    """
+    return render_admin("Contacts", body)
 
 
 @app.route("/admin/contacts/optout", methods=["POST"])
 def admin_contacts_optout():
-    if not admin_logged_in():
-        return redirect(url_for("admin_login"))
+    gate = require_admin()
+    if gate:
+        return gate
 
-    init_db()
-    phone = normalize_e164(request.form.get("phone") or "", DEFAULT_REGION)
+    phone = request.form.get("phone") or ""
+    phone = normalize_e164(phone, DEFAULT_REGION) or phone
     if phone:
-        set_status(phone, "OPTED_OUT")
+        upsert_contact(phone, status="OPTED_OUT", pending_name=0)
         export_contacts_csv_and_optouts()
     return redirect(url_for("admin_contacts"))
 
 
 @app.route("/admin/contacts/optin", methods=["POST"])
 def admin_contacts_optin():
-    if not admin_logged_in():
-        return redirect(url_for("admin_login"))
+    gate = require_admin()
+    if gate:
+        return gate
 
-    init_db()
-    phone = normalize_e164(request.form.get("phone") or "", DEFAULT_REGION)
+    phone = request.form.get("phone") or ""
+    phone = normalize_e164(phone, DEFAULT_REGION) or phone
     if phone:
-        set_status(phone, "OPTED_IN")
+        upsert_contact(phone, status="OPTED_IN", pending_name=0)
         export_contacts_csv_and_optouts()
     return redirect(url_for("admin_contacts"))
 
 
 @app.route("/admin/contacts/delete", methods=["POST"])
 def admin_contacts_delete():
-    if not admin_logged_in():
-        return redirect(url_for("admin_login"))
+    gate = require_admin()
+    if gate:
+        return gate
 
-    init_db()
-    phone = normalize_e164(request.form.get("phone") or "", DEFAULT_REGION)
+    phone = request.form.get("phone") or ""
+    phone = normalize_e164(phone, DEFAULT_REGION) or phone
     if phone:
         delete_contact(phone)
         export_contacts_csv_and_optouts()
     return redirect(url_for("admin_contacts"))
 
 
-@app.route("/admin/contacts/edit", methods=["POST"])
+@app.route("/admin/contacts/edit", methods=["GET", "POST"])
 def admin_contacts_edit():
-    if not admin_logged_in():
-        return redirect(url_for("admin_login"))
+    gate = require_admin()
+    if gate:
+        return gate
 
-    init_db()
-    old_phone = normalize_e164(request.form.get("old_phone") or "", DEFAULT_REGION)
-    new_phone = normalize_e164(request.form.get("new_phone") or "", DEFAULT_REGION)
-    name = clean_name(request.form.get("name") or "")
+    if request.method == "GET":
+        phone = request.args.get("phone", "") or ""
+        phone_norm = normalize_e164(phone, DEFAULT_REGION) or phone
+        c = get_contact(phone_norm)
+        if not c:
+            return redirect(url_for("admin_contacts"))
 
-    if not old_phone or not new_phone:
-        rows = list_contacts()
-        return render_template_string(
-            CONTACTS_HTML, rows=rows, q="", status="ALL", ok=None, error="Invalid phone number."
-        )
+        body = f"""
+        <h2>Edit Contact</h2>
+        <div class="card" style="max-width:720px">
+          <form method="post">
+            <input type="hidden" name="old_phone" value="{c['phone']}">
 
-    ok, msg = edit_contact(old_phone, new_phone, name)
-    export_contacts_csv_and_optouts()
+            <label>Phone number</label>
+            <input name="new_phone" value="{c['phone']}" required />
 
-    if ok:
+            <label>Name</label>
+            <input name="name" value="{(c['name'] or '').replace('"','&quot;')}" />
+
+            <label>Status</label>
+            <select name="status" style="padding:10px;border-radius:10px;border:1px solid #ccc;width:100%">
+              <option value="OPTED_IN" {"selected" if c["status"]=="OPTED_IN" else ""}>OPTED_IN</option>
+              <option value="OPTED_OUT" {"selected" if c["status"]=="OPTED_OUT" else ""}>OPTED_OUT</option>
+            </select>
+
+            <div style="margin-top:14px">
+              <button type="submit">Save</button>
+              <a href="/admin/contacts" class="muted" style="margin-left:12px">Cancel</a>
+            </div>
+          </form>
+        </div>
+        """
+        return render_admin("Edit Contact", body)
+
+    # POST
+    old_phone = request.form.get("old_phone") or ""
+    new_phone_raw = request.form.get("new_phone") or ""
+    new_name_raw = request.form.get("name") or ""
+    new_status = (request.form.get("status") or "OPTED_IN").strip().upper()
+
+    old_phone = normalize_e164(old_phone, DEFAULT_REGION) or old_phone
+    new_phone = normalize_e164(new_phone_raw, DEFAULT_REGION)
+
+    if not new_phone:
+        # re-render quick error page
+        body = """
+        <h2>Edit Contact</h2>
+        <p class="err">Invalid phone number.</p>
+        <p><a href="/admin/contacts">Back</a></p>
+        """
+        return render_admin("Edit Contact", body)
+
+    if new_status not in {"OPTED_IN", "OPTED_OUT"}:
+        new_status = "OPTED_IN"
+
+    new_name = clean_name(new_name_raw)
+
+    # If changing phone to one that already exists (and it's not the same record)
+    if new_phone != old_phone and get_contact(new_phone):
+        body = f"""
+        <h2>Edit Contact</h2>
+        <p class="err">That phone number already exists.</p>
+        <p><a href="/admin/contacts/edit?phone={old_phone}">Back to edit</a></p>
+        """
+        return render_admin("Edit Contact", body)
+
+    # update record
+    existing = get_contact(old_phone)
+    if not existing:
         return redirect(url_for("admin_contacts"))
 
-    rows = list_contacts()
-    return render_template_string(CONTACTS_HTML, rows=rows, q="", status="ALL", ok=None, error=msg)
+    created_at = existing["created_at"]
+
+    with db() as conn:
+        # delete old if phone changed
+        if new_phone != old_phone:
+            conn.execute("DELETE FROM contacts WHERE phone = ?", (old_phone,))
+            conn.execute(
+                """
+                INSERT INTO contacts (phone, name, status, pending_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (new_phone, new_name, new_status, 0, created_at, utc_now()),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE contacts
+                SET name = ?, status = ?, pending_name = 0, updated_at = ?
+                WHERE phone = ?
+                """,
+                (new_name, new_status, utc_now(), old_phone),
+            )
+
+    export_contacts_csv_and_optouts()
+    return redirect(url_for("admin_contacts"))
 
 
 # -------------------------
