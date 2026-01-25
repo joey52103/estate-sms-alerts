@@ -608,7 +608,7 @@ def admin_contacts():
     q = request.args.get("q", "") or ""
     contacts = list_contacts(q=q)
 
-    export_link = "/admin/contacts/export.csv" + (f"?q={q}" if q else "")
+    export_link = "/admin/contacts/export" + (f"?q={q}" if q else "")
 
     rows_html = ""
     for c in contacts:
@@ -837,7 +837,7 @@ def admin_contacts():
     return render_admin("Contacts", body)
 
 
-@app.route("/admin/contacts/export.csv", methods=["GET"])
+@app.route("/admin/contacts/export", methods=["GET"])
 def admin_contacts_export_csv():
     gate = require_admin()
     if gate:
