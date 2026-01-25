@@ -44,6 +44,7 @@ ASK_NAME_ON_JOIN = True
 # Helpers
 # -------------------------
 def utc_now() -> str:
+    # seconds only (cleaner + stable)
     return datetime.utcnow().isoformat(timespec="seconds")
 
 
@@ -75,9 +76,6 @@ def db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    # Matches YOUR current schema (contacts)
-    # id INTEGER PK, phone TEXT NOT NULL UNIQUE, name TEXT, opted_out INTEGER NOT NULL DEFAULT 0,
-    # created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     with db() as conn:
         conn.execute(
             """
@@ -91,7 +89,6 @@ def init_db() -> None:
             )
             """
         )
-        # NEW: audit log
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -119,29 +116,31 @@ def require_admin():
 
 
 def current_actor() -> str:
-    # stored at login
     return (session.get("admin_user") or ADMIN_USER or "admin").strip()
 
 
 def client_ip() -> str:
-    # if behind CF/nginx, you may see X-Forwarded-For; keep simple + safe
     xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
     return xff or (request.remote_addr or "")
 
 
 def audit_log(actor: str, action: str, contact_id: Optional[int], before: Optional[dict], after: Optional[dict]) -> None:
     init_db()
-    now = utc_now()
-    before_json = json.dumps(before, separators=(",", ":"), ensure_ascii=False) if before else None
-    after_json = json.dumps(after, separators=(",", ":"), ensure_ascii=False) if after else None
-    ip = client_ip()
     with db() as conn:
         conn.execute(
             """
             INSERT INTO audit_log (actor, action, contact_id, before_json, after_json, ip, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (actor, action, contact_id, before_json, after_json, ip, now),
+            (
+                actor,
+                action,
+                contact_id,
+                json.dumps(before, ensure_ascii=False) if before else None,
+                json.dumps(after, ensure_ascii=False) if after else None,
+                client_ip(),
+                utc_now(),
+            ),
         )
 
 
@@ -149,7 +148,7 @@ def get_contact_by_phone(phone: str) -> Optional[dict]:
     init_db()
     with db() as conn:
         row = conn.execute(
-            "SELECT id, phone, name, opted_out, created_at, updated_at FROM contacts WHERE phone = ?",
+            "SELECT id, phone, name, opted_out, created_at, updated_at FROM contacts WHERE phone=?",
             (phone,),
         ).fetchone()
         return dict(row) if row else None
@@ -159,14 +158,13 @@ def get_contact_by_id(contact_id: int) -> Optional[dict]:
     init_db()
     with db() as conn:
         row = conn.execute(
-            "SELECT id, phone, name, opted_out, created_at, updated_at FROM contacts WHERE id = ?",
+            "SELECT id, phone, name, opted_out, created_at, updated_at FROM contacts WHERE id=?",
             (contact_id,),
         ).fetchone()
         return dict(row) if row else None
 
 
-def add_contact(phone: str, name: str = "", *, actor: Optional[str] = None, log: bool = True) -> bool:
-    """Returns True if added, False if already exists."""
+def add_contact(phone: str, name: str = "", *, actor: str = "system", log: bool = True) -> bool:
     init_db()
     now = utc_now()
     try:
@@ -179,92 +177,46 @@ def add_contact(phone: str, name: str = "", *, actor: Optional[str] = None, log:
                 (phone, name, now, now),
             )
         if log:
-            c = get_contact_by_phone(phone)
-            audit_log(actor or "system", "create", (c or {}).get("id"), None, c)
+            after = get_contact_by_phone(phone)
+            audit_log(actor, "create", after["id"] if after else None, None, after)
         return True
     except sqlite3.IntegrityError:
         return False
 
 
-def set_opted_out(phone: str, opted_out: int, *, actor: Optional[str] = None, log: bool = True) -> None:
+def set_opted_out(phone: str, opted_out: int, *, actor: str = "system", log: bool = True) -> None:
     init_db()
     before = get_contact_by_phone(phone)
     with db() as conn:
         conn.execute(
-            "UPDATE contacts SET opted_out = ?, updated_at = ? WHERE phone = ?",
+            "UPDATE contacts SET opted_out=?, updated_at=? WHERE phone=?",
             (1 if opted_out else 0, utc_now(), phone),
         )
     after = get_contact_by_phone(phone)
     if log and after:
-        audit_log(actor or "system", "opt_out" if int(opted_out) == 1 else "opt_in", after.get("id"), before, after)
+        audit_log(actor, "opt_out" if int(opted_out) == 1 else "opt_in", after.get("id"), before, after)
 
 
-def delete_contact(phone: str, *, actor: Optional[str] = None, log: bool = True) -> None:
-    init_db()
-    before = get_contact_by_phone(phone)
-    with db() as conn:
-        conn.execute("DELETE FROM contacts WHERE phone = ?", (phone,))
-    if log and before:
-        audit_log(actor or "system", "delete", before.get("id"), before, None)
-
-
-def delete_contact_by_id(contact_id: int, *, actor: Optional[str] = None, log: bool = True) -> bool:
+def delete_contact_by_id(contact_id: int, *, actor: str = "system", log: bool = True) -> bool:
     init_db()
     before = get_contact_by_id(contact_id)
     if not before:
         return False
     with db() as conn:
-        conn.execute("DELETE FROM contacts WHERE id = ?", (contact_id,))
+        conn.execute("DELETE FROM contacts WHERE id=?", (contact_id,))
     if log:
-        audit_log(actor or "system", "delete", contact_id, before, None)
+        audit_log(actor, "delete", contact_id, before, None)
     return True
 
 
-def update_contact(old_phone: str, new_phone: str, new_name: str) -> Optional[str]:
-    """
-    Updates phone and name. Returns error string or None on success.
-    (kept for compatibility with your existing edit page + sms name capture)
-    """
+def update_contact_by_id(contact_id: int, phone: str, name: str, opted_out: int, *, actor: str) -> dict:
     init_db()
-    old = get_contact_by_phone(old_phone)
-    if not old:
-        return "Contact not found."
-
-    if new_phone != old_phone and get_contact_by_phone(new_phone):
-        return "That phone number already exists."
-
-    with db() as conn:
-        if new_phone != old_phone:
-            conn.execute(
-                """
-                UPDATE contacts
-                SET phone = ?, name = ?, updated_at = ?
-                WHERE phone = ?
-                """,
-                (new_phone, new_name, utc_now(), old_phone),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE contacts
-                SET name = ?, updated_at = ?
-                WHERE phone = ?
-                """,
-                (new_name, utc_now(), old_phone),
-            )
-    return None
-
-
-def update_contact_by_id(contact_id: int, new_phone: str, new_name: str, opted_out: int, *, actor: str) -> dict:
-    init_db()
-
     before = get_contact_by_id(contact_id)
     if not before:
         raise ValueError("Contact not found.")
 
-    # If phone is changing, enforce uniqueness
-    if new_phone != before["phone"]:
-        existing = get_contact_by_phone(new_phone)
+    if phone != before["phone"]:
+        existing = get_contact_by_phone(phone)
         if existing and int(existing["id"]) != int(contact_id):
             raise ValueError("That phone number already exists.")
 
@@ -272,10 +224,10 @@ def update_contact_by_id(contact_id: int, new_phone: str, new_name: str, opted_o
         conn.execute(
             """
             UPDATE contacts
-            SET phone = ?, name = ?, opted_out = ?, updated_at = ?
-            WHERE id = ?
+            SET phone=?, name=?, opted_out=?, updated_at=?
+            WHERE id=?
             """,
-            (new_phone, new_name, 1 if opted_out else 0, utc_now(), contact_id),
+            (phone, name, 1 if opted_out else 0, utc_now(), contact_id),
         )
 
     after = get_contact_by_id(contact_id)
@@ -283,7 +235,7 @@ def update_contact_by_id(contact_id: int, new_phone: str, new_name: str, opted_o
     return after
 
 
-def list_contacts(q: str = "") -> List[Dict]:
+def list_contacts(q: str = "") -> List[Dict[str, Any]]:
     init_db()
     q = (q or "").strip()
     with db() as conn:
@@ -313,8 +265,8 @@ def get_counts() -> Dict[str, int]:
     init_db()
     with db() as conn:
         total = conn.execute("SELECT COUNT(*) AS c FROM contacts").fetchone()["c"]
-        opted_in = conn.execute("SELECT COUNT(*) AS c FROM contacts WHERE opted_out = 0").fetchone()["c"]
-        opted_out = conn.execute("SELECT COUNT(*) AS c FROM contacts WHERE opted_out = 1").fetchone()["c"]
+        opted_in = conn.execute("SELECT COUNT(*) AS c FROM contacts WHERE opted_out=0").fetchone()["c"]
+        opted_out = conn.execute("SELECT COUNT(*) AS c FROM contacts WHERE opted_out=1").fetchone()["c"]
     return {"total": int(total), "opted_in": int(opted_in), "opted_out": int(opted_out)}
 
 
@@ -322,10 +274,10 @@ def export_contacts_csv_and_optouts() -> None:
     init_db()
     with db() as conn:
         opted_in = conn.execute(
-            "SELECT phone, name FROM contacts WHERE opted_out = 0 ORDER BY updated_at DESC"
+            "SELECT phone, name FROM contacts WHERE opted_out=0 ORDER BY updated_at DESC"
         ).fetchall()
         opted_out = conn.execute(
-            "SELECT phone FROM contacts WHERE opted_out = 1 ORDER BY updated_at DESC"
+            "SELECT phone FROM contacts WHERE opted_out=1 ORDER BY updated_at DESC"
         ).fetchall()
 
     with open(EXPORT_CSV, "w", newline="", encoding="utf-8") as f:
@@ -345,7 +297,7 @@ def tokens_upper(body: str) -> set:
 
 
 # -------------------------
-# Admin UI
+# Admin UI base template
 # -------------------------
 BASE_HTML = """
 <!doctype html>
@@ -364,10 +316,6 @@ BASE_HTML = """
     .ok{color:#0a7a2f;font-weight:700}
     .err{color:#b00020;font-weight:700}
     a{color:#0b5fff;text-decoration:none}
-    .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid #eee;gap:14px}
-    .navleft{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-    .navleft a{font-weight:700}
-    .navright{display:flex;align-items:center;gap:14px}
     table{border-collapse:collapse;width:100%}
     th,td{border:1px solid #ddd;padding:10px;text-align:left;vertical-align:top}
     th{background:#f7f7f7}
@@ -377,17 +325,21 @@ BASE_HTML = """
     .in{background:#e9f7ef;color:#0a7a2f}
     .out{background:#fdecea;color:#b00020}
     .muted{color:#666}
-    .searchRow{display:flex;gap:10px;align-items:center;margin:10px 0 18px}
-    .searchRow input{flex:1}
-    .actionsTop{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:10px 0 14px}
-    .actionsTop .left{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
     .small{font-size:12px}
     .badge{display:inline-block;padding:2px 10px;border-radius:999px;background:#eef2ff;color:#1e40af;font-weight:800;font-size:12px}
     .kbd{font-family:ui-monospace, SFMono-Regular, Menlo, monospace;background:#f2f3f5;border-radius:8px;padding:2px 6px;font-size:12px}
 
-    /* Inline edit UI */
-    .cellLine{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
-    .cellLine .col{min-width:240px}
+    .nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid #eee;gap:14px}
+    .navleft{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+    .navleft a{font-weight:700}
+    .navright{display:flex;align-items:center;gap:14px}
+
+    .searchRow{display:flex;gap:10px;align-items:center;margin:10px 0 18px}
+    .searchRow input{flex:1}
+
+    .actionsTop{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:10px 0 14px}
+
+    /* Inline edit */
     .inlineField{display:none}
     .editing .inlineView{display:none}
     .editing .inlineField{display:block}
@@ -399,6 +351,7 @@ BASE_HTML = """
     .modal{background:white;border-radius:16px;max-width:520px;width:100%;border:1px solid #e5e7eb;box-shadow:0 20px 60px rgba(0,0,0,.25);padding:18px}
     .modal h3{margin:0 0 6px}
     .modal .row{display:flex;gap:10px;justify-content:flex-end;margin-top:14px}
+
     .toast{position:fixed;bottom:16px;left:16px;background:#111827;color:white;padding:10px 12px;border-radius:12px;display:none;z-index:10000}
   </style>
 </head>
@@ -451,18 +404,17 @@ def home():
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     if admin_logged_in():
-        return redirect(url_for("admin_add"))
+        return redirect(url_for("admin_contacts"))
 
     error = ""
     if request.method == "POST":
         user = (request.form.get("user") or "").strip()
         pw = (request.form.get("password") or "").strip()
 
-        # IMPORTANT: ADMIN_PASSWORD must be set (non-empty) in .env
         if user == ADMIN_USER and ADMIN_PASSWORD and pw == ADMIN_PASSWORD:
             session["admin_authed"] = True
             session["admin_user"] = user
-            return redirect(url_for("admin_add"))
+            return redirect(url_for("admin_contacts"))
         error = "Invalid login."
 
     body = f"""
@@ -489,7 +441,7 @@ def admin_logout():
 
 
 # -------------------------
-# NEW: Admin API endpoints
+# Admin API
 # -------------------------
 @app.route("/admin/api/contacts/exists", methods=["GET"])
 def admin_api_contacts_exists():
@@ -503,15 +455,7 @@ def admin_api_contacts_exists():
         return jsonify({"ok": True, "valid": False, "exists": False})
 
     c = get_contact_by_phone(phone)
-    return jsonify(
-        {
-            "ok": True,
-            "valid": True,
-            "exists": bool(c),
-            "name": (c or {}).get("name", ""),
-            "id": (c or {}).get("id"),
-        }
-    )
+    return jsonify({"ok": True, "valid": True, "exists": bool(c), "name": (c or {}).get("name", ""), "id": (c or {}).get("id")})
 
 
 @app.route("/admin/api/contacts/<int:contact_id>", methods=["POST"])
@@ -564,8 +508,8 @@ def admin_add():
     if gate:
         return gate
 
-    ok = ""
-    error = ""
+    ok_msg = ""
+    err_msg = ""
 
     if request.method == "POST":
         raw_phone = request.form.get("phone") or ""
@@ -575,35 +519,17 @@ def admin_add():
         name = clean_name(raw_name)
 
         if not phone:
-            error = "That phone number looks invalid. Try again (include area code)."
+            err_msg = "That phone number looks invalid. Try again (include area code)."
         else:
             added = add_contact(phone, name, actor=current_actor(), log=True)
             if not added:
-                error = "Number already added."
+                err_msg = "Number already added."
             else:
                 export_contacts_csv_and_optouts()
-                ok = f"Added: {phone}" + (f" ({name})" if name else "")
+                ok_msg = f"Added: {phone}" + (f" ({name})" if name else "")
 
-    body = f"""
-    <h2>Admin – Add Contact</h2>
-    <div class="card" style="max-width:720px">
-      <form method="post" id="addForm">
-        <label>Phone number</label>
-        <input id="phoneInput" name="phone" placeholder="(412) 555-1234" required />
-        <div id="phoneLiveMsg" class="small muted" style="margin-top:2px"></div>
-
-        <label style="margin-top:10px">Name (optional)</label>
-        <input name="name" placeholder="Joey" />
-
-        <button id="addBtn" type="submit">Add</button>
-      </form>
-
-      {"<p class='ok'>" + ok + "</p>" if ok else ""}
-      {"<p class='err'>" + error + "</p>" if error else ""}
-
-      <p class="muted"><small>Saved to database and exported to contacts.csv automatically.</small></p>
-    </div>
-
+    # IMPORTANT: this block is NOT an f-string (JS has braces)
+    js_block = """
     <script>
       (function(){
         const phoneInput = document.getElementById('phoneInput');
@@ -648,6 +574,28 @@ def admin_add():
       })();
     </script>
     """
+
+    body = f"""
+    <h2>Admin – Add Contact</h2>
+    <div class="card" style="max-width:720px">
+      <form method="post" id="addForm">
+        <label>Phone number</label>
+        <input id="phoneInput" name="phone" placeholder="(412) 555-1234" required />
+        <div id="phoneLiveMsg" class="small muted" style="margin-top:2px"></div>
+
+        <label style="margin-top:10px">Name (optional)</label>
+        <input name="name" placeholder="Joey" />
+
+        <button id="addBtn" type="submit">Add</button>
+      </form>
+
+      {"<p class='ok'>" + ok_msg + "</p>" if ok_msg else ""}
+      {"<p class='err'>" + err_msg + "</p>" if err_msg else ""}
+
+      <p class="muted"><small>Saved to database and exported to contacts.csv automatically.</small></p>
+    </div>
+    {js_block}
+    """
     return render_admin("Add Contact", body)
 
 
@@ -660,14 +608,13 @@ def admin_contacts():
     q = request.args.get("q", "") or ""
     contacts = list_contacts(q=q)
 
-    # Export link respects search query
     export_link = "/admin/contacts/export.csv" + (f"?q={q}" if q else "")
 
     rows_html = ""
     for c in contacts:
         cid = int(c["id"])
         phone = c["phone"]
-        name = (c["name"] or "").strip()
+        name = (c["name"] or "").strip().replace('"', "&quot;")
         opted_out = int(c["opted_out"]) == 1
         updated = c["updated_at"]
 
@@ -676,20 +623,15 @@ def admin_contacts():
         rows_html += f"""
         <tr id="row-{cid}" data-id="{cid}">
           <td>
-            <div class="cellLine">
-              <div class="col">
-                <div class="inlineView">
-                  <strong class="v-phone">{phone}</strong><br>
-                  <span class="muted v-name">{name}</span>
-                </div>
-
-                <div class="inlineField">
-                  <label class="small muted" style="display:block;margin-top:2px">Phone</label>
-                  <input class="miniInput i-phone" value="{phone}" />
-                  <label class="small muted" style="display:block;margin-top:8px">Name</label>
-                  <input class="miniInput i-name" value="{(name.replace('"','&quot;'))}" />
-                </div>
-              </div>
+            <div class="inlineView">
+              <strong class="v-phone">{phone}</strong><br>
+              <span class="muted v-name">{name}</span>
+            </div>
+            <div class="inlineField">
+              <label class="small muted" style="display:block;margin-top:2px">Phone</label>
+              <input class="miniInput i-phone" value="{phone}" />
+              <label class="small muted" style="display:block;margin-top:8px">Name</label>
+              <input class="miniInput i-name" value="{name}" />
             </div>
           </td>
 
@@ -697,7 +639,6 @@ def admin_contacts():
             <div class="inlineView">
               {pill}<br><span class="muted">Updated: <span class="v-updated">{updated}</span></span>
             </div>
-
             <div class="inlineField">
               <label class="small muted" style="display:block;margin-top:2px">Status</label>
               <select class="miniSelect i-status">
@@ -732,6 +673,125 @@ def admin_contacts():
         </tr>
         """
 
+    # IMPORTANT: NOT an f-string (JS braces)
+    js_block = """
+    <script>
+      let __deleteId = null;
+
+      function rowEl(id) {
+        return document.getElementById('row-' + id);
+      }
+
+      function startEdit(id) {
+        const r = rowEl(id);
+        if(!r) return;
+        r.classList.add('editing');
+      }
+
+      function cancelEdit(id) {
+        const r = rowEl(id);
+        if(!r) return;
+
+        r.querySelector('.i-phone').value = r.querySelector('.v-phone').textContent.trim();
+        r.querySelector('.i-name').value = r.querySelector('.v-name').textContent.trim();
+        const pillText = (r.querySelector('.inlineView .pill') || {textContent:''}).textContent || '';
+        r.querySelector('.i-status').value = pillText.includes('OUT') ? '1' : '0';
+
+        r.classList.remove('editing');
+      }
+
+      async function saveEdit(id) {
+        const r = rowEl(id);
+        if(!r) return;
+
+        const phone = (r.querySelector('.i-phone').value || '').trim();
+        const name = (r.querySelector('.i-name').value || '').trim();
+        const opted_out = (r.querySelector('.i-status').value || '0');
+
+        try {
+          const res = await fetch('/admin/api/contacts/' + id, {
+            method: 'POST',
+            headers: {'Content-Type':'application/json'},
+            credentials: 'same-origin',
+            body: JSON.stringify({phone, name, opted_out})
+          });
+          const data = await res.json();
+          if(!data.ok) {
+            showToast(data.error || 'Update failed.');
+            return;
+          }
+
+          r.querySelector('.v-phone').textContent = data.contact.phone;
+          r.querySelector('.v-name').textContent = data.contact.name || '';
+
+          const statusCell = r.children[1];
+          const pill = statusCell.querySelector('.inlineView .pill');
+          if(pill) {
+            const out = (parseInt(data.contact.opted_out) === 1);
+            pill.textContent = out ? 'OPTED OUT' : 'OPTED IN';
+            pill.className = 'pill ' + (out ? 'out' : 'in');
+          }
+
+          const upd = data.contact.updated_at || '';
+          const vUpdated = r.querySelector('.v-updated');
+          const vUpdated2 = r.querySelector('.v-updated-2');
+          if(vUpdated) vUpdated.textContent = upd;
+          if(vUpdated2) vUpdated2.textContent = upd;
+
+          r.classList.remove('editing');
+          showToast('Saved.');
+        } catch(e) {
+          showToast('Update failed.');
+        }
+      }
+
+      function openDeleteModal(id) {
+        const r = rowEl(id);
+        if(!r) return;
+        __deleteId = id;
+
+        const phone = (r.querySelector('.v-phone')?.textContent || '').trim();
+        const name = (r.querySelector('.v-name')?.textContent || '').trim();
+        const desc = document.getElementById('deleteDesc');
+        desc.textContent = 'Delete ' + (name ? (name + ' ') : '') + '(' + phone + ')? This cannot be undone.';
+
+        document.getElementById('modalOverlay').style.display = 'flex';
+      }
+
+      function closeDeleteModal() {
+        __deleteId = null;
+        document.getElementById('modalOverlay').style.display = 'none';
+      }
+
+      async function confirmDelete() {
+        if(__deleteId == null) return;
+        const id = __deleteId;
+
+        try {
+          const res = await fetch('/admin/api/contacts/' + id + '/delete', {
+            method: 'POST',
+            credentials: 'same-origin'
+          });
+          const data = await res.json();
+          if(!data.ok) {
+            showToast(data.error || 'Delete failed.');
+            return;
+          }
+          const r = rowEl(id);
+          if(r) r.remove();
+          closeDeleteModal();
+          showToast('Deleted.');
+        } catch(e) {
+          showToast('Delete failed.');
+        }
+      }
+
+      document.getElementById('modalOverlay').addEventListener('click', (e)=>{
+        if(e.target && e.target.id === 'modalOverlay') closeDeleteModal();
+      });
+    </script>
+    """
+
     body = f"""
     <h2>Admin – Contacts</h2>
 
@@ -761,7 +821,6 @@ def admin_contacts():
       <p class="muted small" style="margin-top:12px">Tip: Inline edit updates the DB + exports files immediately.</p>
     </div>
 
-    <!-- Delete Modal -->
     <div id="modalOverlay" class="modalOverlay" role="dialog" aria-modal="true">
       <div class="modal">
         <h3>Delete contact?</h3>
@@ -773,124 +832,7 @@ def admin_contacts():
       </div>
     </div>
 
-    <script>
-      let __deleteId = null;
-
-      function rowEl(id) {{
-        return document.getElementById('row-' + id);
-      }}
-
-      function startEdit(id) {{
-        const r = rowEl(id);
-        if(!r) return;
-        r.classList.add('editing');
-      }}
-
-      function cancelEdit(id) {{
-        const r = rowEl(id);
-        if(!r) return;
-        // reset inputs back to current displayed values
-        r.querySelector('.i-phone').value = r.querySelector('.v-phone').textContent.trim();
-        r.querySelector('.i-name').value = r.querySelector('.v-name').textContent.trim();
-        const pillText = (r.querySelector('.inlineView .pill') || {{textContent:''}}).textContent || '';
-        r.querySelector('.i-status').value = pillText.includes('OUT') ? '1' : '0';
-        r.classList.remove('editing');
-      }}
-
-      async function saveEdit(id) {{
-        const r = rowEl(id);
-        if(!r) return;
-
-        const phone = (r.querySelector('.i-phone').value || '').trim();
-        const name = (r.querySelector('.i-name').value || '').trim();
-        const opted_out = (r.querySelector('.i-status').value || '0');
-
-        try {{
-          const res = await fetch('/admin/api/contacts/' + id, {{
-            method: 'POST',
-            headers: {{'Content-Type':'application/json'}},
-            credentials: 'same-origin',
-            body: JSON.stringify({{phone, name, opted_out}})
-          }});
-          const data = await res.json();
-          if(!data.ok) {{
-            showToast(data.error || 'Update failed.');
-            return;
-          }}
-
-          // Update display fields
-          r.querySelector('.v-phone').textContent = data.contact.phone;
-          r.querySelector('.v-name').textContent = data.contact.name || '';
-
-          const statusCell = r.children[1];
-          const pill = statusCell.querySelector('.inlineView .pill');
-          if(pill) {{
-            const out = (parseInt(data.contact.opted_out) === 1);
-            pill.textContent = out ? 'OPTED OUT' : 'OPTED IN';
-            pill.className = 'pill ' + (out ? 'out' : 'in');
-          }}
-
-          const upd = data.contact.updated_at || '';
-          const vUpdated = r.querySelector('.v-updated');
-          const vUpdated2 = r.querySelector('.v-updated-2');
-          if(vUpdated) vUpdated.textContent = upd;
-          if(vUpdated2) vUpdated2.textContent = upd;
-
-          r.classList.remove('editing');
-          showToast('Saved.');
-        }} catch(e) {{
-          showToast('Update failed.');
-        }}
-      }}
-
-      function openDeleteModal(id) {{
-        const r = rowEl(id);
-        if(!r) return;
-        __deleteId = id;
-
-        const phone = (r.querySelector('.v-phone')?.textContent || '').trim();
-        const name = (r.querySelector('.v-name')?.textContent || '').trim();
-        const desc = document.getElementById('deleteDesc');
-        desc.textContent = 'Delete ' + (name ? (name + ' ') : '') + '(' + phone + ')? This cannot be undone.';
-
-        const o = document.getElementById('modalOverlay');
-        o.style.display = 'flex';
-      }}
-
-      function closeDeleteModal() {{
-        __deleteId = null;
-        const o = document.getElementById('modalOverlay');
-        o.style.display = 'none';
-      }}
-
-      async function confirmDelete() {{
-        if(__deleteId == null) return;
-        const id = __deleteId;
-
-        try {{
-          const res = await fetch('/admin/api/contacts/' + id + '/delete', {{
-            method: 'POST',
-            credentials: 'same-origin'
-          }});
-          const data = await res.json();
-          if(!data.ok) {{
-            showToast(data.error || 'Delete failed.');
-            return;
-          }}
-          const r = rowEl(id);
-          if(r) r.remove();
-          closeDeleteModal();
-          showToast('Deleted.');
-        }} catch(e) {{
-          showToast('Delete failed.');
-        }}
-      }}
-
-      // Close modal by clicking overlay
-      document.getElementById('modalOverlay').addEventListener('click', (e)=>{{
-        if(e.target && e.target.id === 'modalOverlay') closeDeleteModal();
-      }});
-    </script>
+    {js_block}
     """
     return render_admin("Contacts", body)
 
@@ -904,14 +846,14 @@ def admin_contacts_export_csv():
     q = (request.args.get("q") or "").strip()
     contacts = list_contacts(q=q)
 
+    def esc(v: Any) -> str:
+        s = "" if v is None else str(v)
+        s = s.replace('"', '""')
+        return f'"{s}"'
+
     def csv_lines():
         yield "id,phone,name,opted_out,created_at,updated_at\n"
         for c in contacts:
-            # basic csv escaping
-            def esc(v: Any) -> str:
-                s = "" if v is None else str(v)
-                s = s.replace('"', '""')
-                return f'"{s}"'
             yield ",".join(
                 [
                     esc(c.get("id")),
@@ -937,7 +879,6 @@ def admin_audit():
     if gate:
         return gate
 
-    # show latest 250
     init_db()
     with db() as conn:
         rows = conn.execute(
@@ -968,9 +909,7 @@ def admin_audit():
             for k in ["phone", "name", "opted_out"]:
                 if str(before.get(k)) != str(after.get(k)):
                     changes.append(f"{k}: {before.get(k)} → {after.get(k)}")
-            if changes:
-                return "; ".join(changes)
-            return "Updated (no visible change)"
+            return "; ".join(changes) if changes else "Updated"
         return ""
 
     rows_html = ""
@@ -980,11 +919,12 @@ def admin_audit():
         when = r["created_at"] or ""
         ip = r["ip"] or ""
         summary = summarize(r["before_json"], r["after_json"])
+        pill_class = "out" if ("DELETE" in action or "OUT" in action) else "in"
         rows_html += f"""
         <tr>
           <td><strong>{when}</strong><br><span class="muted small">{ip}</span></td>
           <td><strong>{actor}</strong></td>
-          <td><span class="pill {'out' if 'DELETE' in action or 'OUT' in action else 'in'}">{action}</span></td>
+          <td><span class="pill {pill_class}">{action}</span></td>
           <td class="muted">{summary}</td>
         </tr>
         """
@@ -1002,7 +942,9 @@ def admin_audit():
         </tr>
         {rows_html if rows_html else "<tr><td colspan='4'>No audit entries yet.</td></tr>"}
       </table>
-      <p class="muted small" style="margin-top:12px">Note: Actions include create/update/delete/opt in/opt out from the admin panel (and some SMS actions as actor <span class="kbd">system</span>).</p>
+      <p class="muted small" style="margin-top:12px">
+        Actions include create/update/delete/opt in/opt out from the admin panel and SMS actions as actor <span class="kbd">system</span>.
+      </p>
     </div>
     """
     return render_admin("Audit Log", body)
@@ -1036,98 +978,8 @@ def admin_contacts_optin():
     return redirect(url_for("admin_contacts"))
 
 
-# (Kept) Old delete endpoint for safety/backward compatibility
-@app.route("/admin/contacts/delete", methods=["POST"])
-def admin_contacts_delete():
-    gate = require_admin()
-    if gate:
-        return gate
-
-    phone = request.form.get("phone") or ""
-    phone = normalize_e164(phone, DEFAULT_REGION) or phone
-    if phone:
-        delete_contact(phone, actor=current_actor(), log=True)
-        export_contacts_csv_and_optouts()
-    return redirect(url_for("admin_contacts"))
-
-
-# (Kept) Old edit page (optional fallback)
-@app.route("/admin/contacts/edit", methods=["GET", "POST"])
-def admin_contacts_edit():
-    gate = require_admin()
-    if gate:
-        return gate
-
-    if request.method == "GET":
-        phone = request.args.get("phone", "") or ""
-        phone_norm = normalize_e164(phone, DEFAULT_REGION) or phone
-        c = get_contact_by_phone(phone_norm)
-        if not c:
-            return redirect(url_for("admin_contacts"))
-
-        body = f"""
-        <h2>Edit Contact (Fallback)</h2>
-        <div class="card" style="max-width:720px">
-          <p class="muted small">This page is kept as a backup. The main workflow is inline editing on the Contacts page.</p>
-          <form method="post">
-            <input type="hidden" name="old_phone" value="{c['phone']}">
-
-            <label>Phone number</label>
-            <input name="new_phone" value="{c['phone']}" required />
-
-            <label>Name</label>
-            <input name="name" value="{(c['name'] or '').replace('"','&quot;')}" />
-
-            <label>Status</label>
-            <select name="opted_out">
-              <option value="0" {"selected" if int(c["opted_out"])==0 else ""}>OPTED IN</option>
-              <option value="1" {"selected" if int(c["opted_out"])==1 else ""}>OPTED OUT</option>
-            </select>
-
-            <div style="margin-top:14px">
-              <button type="submit">Save</button>
-              <a href="/admin/contacts" class="muted" style="margin-left:12px">Cancel</a>
-            </div>
-          </form>
-        </div>
-        """
-        return render_admin("Edit Contact", body)
-
-    # POST
-    old_phone = request.form.get("old_phone") or ""
-    new_phone_raw = request.form.get("new_phone") or ""
-    new_name_raw = request.form.get("name") or ""
-    opted_out_raw = request.form.get("opted_out") or "0"
-
-    old_phone = normalize_e164(old_phone, DEFAULT_REGION) or old_phone
-    new_phone = normalize_e164(new_phone_raw, DEFAULT_REGION)
-    if not new_phone:
-        return render_admin("Edit Contact", "<p class='err'>Invalid phone number.</p><p><a href='/admin/contacts'>Back</a></p>")
-
-    new_name = clean_name(new_name_raw)
-
-    # audit here too
-    before = get_contact_by_phone(old_phone)
-    err = update_contact(old_phone, new_phone, new_name)
-    if err:
-        return render_admin("Edit Contact", f"<p class='err'>{err}</p><p><a href='/admin/contacts'>Back</a></p>")
-
-    try:
-        opted_out_val = 1 if str(opted_out_raw).strip() == "1" else 0
-        set_opted_out(new_phone, opted_out_val, actor=current_actor(), log=False)  # we'll log once as "update"
-    except Exception:
-        pass
-
-    after = get_contact_by_phone(new_phone)
-    if after:
-        audit_log(current_actor(), "update", after.get("id"), before, after)
-
-    export_contacts_csv_and_optouts()
-    return redirect(url_for("admin_contacts"))
-
-
 # -------------------------
-# Twilio Webhook
+# Twilio Webhook (/sms)
 # -------------------------
 @app.route("/sms", methods=["POST"])
 def inbound_sms():
@@ -1147,11 +999,9 @@ def inbound_sms():
     c = get_contact_by_phone(phone)
 
     if toks & OPTOUT_KEYWORDS:
-        if c:
-            set_opted_out(phone, 1, actor="system", log=True)
-        else:
+        if not c:
             add_contact(phone, "", actor="system", log=True)
-            set_opted_out(phone, 1, actor="system", log=True)
+        set_opted_out(phone, 1, actor="system", log=True)
         export_contacts_csv_and_optouts()
         resp.message("You’re opted out. Reply START to resubscribe.")
         return str(resp), 200, {"Content-Type": "application/xml"}
@@ -1161,32 +1011,23 @@ def inbound_sms():
         return str(resp), 200, {"Content-Type": "application/xml"}
 
     if toks & OPTIN_KEYWORDS:
-        if c:
-            set_opted_out(phone, 0, actor="system", log=True)
-            export_contacts_csv_and_optouts()
-            resp.message("You’re subscribed! Reply STOP to opt out.")
-            return str(resp), 200, {"Content-Type": "application/xml"}
-
-        # new subscriber
-        if ASK_NAME_ON_JOIN:
+        if not c:
             add_contact(phone, "", actor="system", log=True)
-            set_opted_out(phone, 0, actor="system", log=True)
-            export_contacts_csv_and_optouts()
+        set_opted_out(phone, 0, actor="system", log=True)
+        export_contacts_csv_and_optouts()
+        if ASK_NAME_ON_JOIN and (not c or not (c.get("name") or "").strip()):
             resp.message("You’re subscribed! Reply with your first name (example: Joey). Reply STOP to opt out.")
-            return str(resp), 200, {"Content-Type": "application/xml"}
         else:
-            add_contact(phone, "", actor="system", log=True)
-            set_opted_out(phone, 0, actor="system", log=True)
-            export_contacts_csv_and_optouts()
             resp.message("You’re subscribed! Reply STOP to opt out.")
-            return str(resp), 200, {"Content-Type": "application/xml"}
+        return str(resp), 200, {"Content-Type": "application/xml"}
 
-    # If opted in and name is empty, treat message as name (only if not a keyword)
+    # If opted in and name empty, treat message as name
     if c and int(c["opted_out"]) == 0 and ASK_NAME_ON_JOIN and not (c["name"] or "").strip():
         name = clean_name(body)
         if name:
             before = get_contact_by_phone(phone)
-            update_contact(phone, phone, name)
+            with db() as conn:
+                conn.execute("UPDATE contacts SET name=?, updated_at=? WHERE phone=?", (name, utc_now(), phone))
             after = get_contact_by_phone(phone)
             if after:
                 audit_log("system", "update", after.get("id"), before, after)
